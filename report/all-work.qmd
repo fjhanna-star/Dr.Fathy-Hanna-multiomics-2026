@@ -1,0 +1,1428 @@
+---
+title: "Data Science for Biology — Workshop 2"
+subtitle: "Multiomics group project (Study B) and module worksheets, compiled into one report"
+author: "Workshop workspace: Dr. Fathy Hanna multiomics 2026"
+date: "Rendered from report/all-work.qmd"
+format:
+  docx:
+    toc: true
+    toc-depth: 2
+number-sections: true
+execute:
+  warning: false
+  message: false
+  fig.width: 8
+---
+
+This document gathers **all the work in the workspace** and rearranges it into
+the flow of a paper: introduction, methods, results, discussion. The two group
+project reports (quality control and differential abundance for Study B) are
+fully executed, and one new comparison — the BV-adjusted design against the
+unadjusted design — was added while compiling. The four workshop module
+worksheets are included in the appendices as they stand: they are templates
+with the answer prompts still blank, so their code is shown but not run here.
+The appendices are followed by lists of every result file and figure produced.
+
+```{r global-setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 8)
+library(here)
+```
+
+# Introduction
+
+## The three datasets
+
+The workshop's second week uses three multiomics datasets in
+`data/2-workshop2/`, each with the same six files and the same column names:
+
+- **`instructional_dataset/`** — a pregnancy cohort: 157 participants at three
+  visits (weeks 18, 24 and 34), outcome term (342 samples) or preterm (129).
+- **`group_a_probiotic/`** — a probiotic trial, before and after.
+- **`group_b_contraception/`** — three contraceptive methods (pill,
+  injectable, ring), 93 samples.
+
+Each folder holds `01_metadata.csv`, `02_microbiome_counts.csv` (220 species),
+`03_microbiome_taxonomy.csv`, `04_rnaseq_counts.csv.gz` (14,226 genes),
+`05_gene_annotation.csv` and `06_cytokines.csv`. Both count tables are
+**features in rows, samples in columns**.
+
+## The group project question
+
+The group project studies **Study B, the contraception study**: does the
+vaginal bacterial community differ across the three contraceptive arms? The
+analysis pipeline was built in two documents — a quality control report and a
+DESeq2 differential abundance test — and this document presents both, in
+order, with a new comparison of the two DESeq2 designs that were run.
+
+## How this document is organised
+
+| Section | Source in the workspace |
+|---|---|
+| §3.1 Quality control | `group_project/01-qc.qmd` |
+| §3.2 Differential abundance (BV-adjusted) | `group_project/04-differential.qmd` |
+| §3.3 Adjusted vs unadjusted design | result CSVs in `group_project/` |
+| §5 Choices made | both reports, merged |
+| Appendices B–F | `notebooks/02–05` and `notebooks/00-hello-r.qmd` |
+
+# Data and methods
+
+## Reading the data
+
+All loading goes through the helper `R/count_tables.R`:
+
+```{r method-helper, eval=FALSE, echo=TRUE}
+source(here::here("R/count_tables.R"))
+
+d <- read_counts("instructional")   # or "group_a", "group_b"
+d$metadata                          # one row per sample
+d$species                           # 220 species x 471 samples
+d$genes                             # 14,226 genes x 471 samples
+```
+
+The helper reorders the count-table columns to match `metadata$sample_id`, so
+every later test starts with the rows and columns correctly lined up.
+
+## Rules this analysis follows
+
+- **Raw counts go into DESeq2** — never CPM, never logged. DESeq2 estimates
+  its own size-factor normalisation.
+- **Column order is checked** against the metadata rows before any test;
+  DESeq2 will not warn if they are wrong, it will just be wrong.
+- **A group defined from one table is never tested on that same table** — it
+  is defined from one and tested on the other.
+- **Both count tables are compositional.** "Relative abundance went down" is
+  not the same claim as "there was less of it"; fold changes are read as
+  relative statements.
+
+# Results
+
+## Quality control of Study B
+
+*Reproduced from `group_project/01-qc.qmd`.*
+
+This report checks the Study B data before any real analysis. We look at five things: that the sample IDs agree across all the tables, how big each library is (the total reads per sample), where values are missing, whether the two sequencing batches are spread evenly across the three arms, and Shannon alpha diversity as a first look at the microbiome data.
+
+```{r qc-setup, include=FALSE}
+source(here::here("R/count_tables.R"))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(vegan)
+
+d <- read_counts("group_b")
+meta <- d$metadata
+species <- d$species
+genes <- d$genes
+cyto <- d$cytokines
+```
+
+### Do the sample IDs match?
+
+All four tables must describe the same 93 samples. The helper `read_counts()` already reorders the count columns to match `metadata$sample_id`, but we check it anyway — if the IDs ever disagree, every later test would be silently wrong.
+
+```{r qc-ids}
+# The distinct sample IDs in each table, as sets
+ids <- list(
+  metadata = meta$sample_id,
+  cytokines = cyto$sample_id,
+  species_cols = colnames(species),
+  genes_cols = colnames(genes)
+)
+
+# setequal() ignores order; identical() asks if the order already matches
+data.frame(
+  table = names(ids),
+  n_ids = sapply(ids, length),
+  same_set_as_metadata = sapply(ids, setequal, y = meta$sample_id),
+  same_order_as_metadata = sapply(ids, identical, y = meta$sample_id)
+)
+```
+
+All four tables hold the same 93 sample IDs, and the count matrices are already in metadata order, so every row of `meta` lines up with its column of counts. If any of this were `FALSE`, we would stop and fix it before testing anything.
+
+### Library sizes
+
+The **library size** is the total count in a sample: total reads assigned to species, or total reads mapped to genes. Very small libraries are unreliable, and wildly uneven sizes can drive apparent differences, so we plot both.
+
+```{r qc-libsize-numbers}
+lib <- data.frame(
+  sample_id = meta$sample_id,
+  species_total = colSums(species),
+  genes_total = colSums(genes)
+)
+
+summary(lib[, c("species_total", "genes_total")])
+```
+
+```{r qc-libsize-plot}
+# Histograms side by side; the red dashed line is the median
+lib |>
+  pivot_longer(cols = c(species_total, genes_total),
+               names_to = "table", values_to = "total") |>
+  ggplot(aes(total)) +
+  geom_histogram(bins = 30, fill = "grey70", colour = "white") +
+  geom_vline(aes(xintercept = median(total)), linetype = "dashed", colour = "red") +
+  facet_wrap(~ table, scales = "free") +
+  labs(title = "Library sizes per sample",
+       x = "total counts per sample", y = "number of samples") +
+  theme_minimal()
+```
+
+```{r qc-libsize-smallest}
+# Smallest libraries — worth knowing who they are before filtering
+lib |> slice_min(species_total, n = 3)
+lib |> slice_min(genes_total, n = 3)
+```
+
+### Missing values
+
+Missing data in the metadata and the cytokines table. Counts tables are not checked here because a zero is a real observation, not a missing value.
+
+```{r qc-missing}
+# Missing values per column, only showing columns that have any
+missing_meta <- tibble(column = names(meta), n_missing = colSums(is.na(meta)))
+missing_meta |> filter(n_missing > 0)
+
+missing_cyto <- tibble(column = names(cyto), n_missing = colSums(is.na(cyto)))
+missing_cyto |> filter(n_missing > 0)
+```
+
+```{r qc-missing-count}
+# How many samples have at least one missing cytokine?
+cat(sum(rowSums(is.na(cyto)) > 0), "of", nrow(cyto),
+    "samples have at least one missing cytokine value\n")
+```
+
+The cytokine values that are missing are dropped sample-by-sample in whatever cytokine analysis follows; the metadata is complete, so no samples need to be excluded from the microbiome or RNA work.
+
+### RNA batch vs arm
+
+The RNA was sequenced in two batches (B1, B2). If one batch contained mostly one arm, batch effects could masquerade as arm effects, so we cross-tabulate.
+
+```{r qc-batch-table}
+with(meta, table(arm, rnaseq_batch))
+```
+
+```{r qc-batch-prop}
+# Same numbers as proportions within each arm
+with(meta, prop.table(table(arm, rnaseq_batch), margin = 1)) |>
+  round(2)
+```
+
+Both batches contain samples from all three arms, so no arm is confined to a single batch. Any downstream RNA analysis can adjust for `rnaseq_batch` if the batch effect turns out to be large.
+
+### Shannon alpha diversity
+
+The **Shannon index** summarises how diverse each sample's microbiome is: it grows with the number of species present and with how evenly their counts are spread. Higher = more diverse. We compute it per sample and compare arms.
+
+```{r qc-alpha}
+# vegan wants samples in rows, so we transpose the matrix
+alpha <- diversity(t(species), index = "shannon")
+
+alpha_df <- data.frame(
+  sample_id = names(alpha),
+  shannon = as.numeric(alpha)
+) |>
+  left_join(meta, by = "sample_id")
+
+summary(alpha_df$shannon)
+```
+
+```{r qc-alpha-plot}
+# Shannon by arm — a boxplot shows the spread in each group
+ggplot(alpha_df, aes(arm, shannon, fill = arm)) +
+  geom_boxplot(outlier.alpha = 0.5, show.legend = FALSE) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Shannon alpha diversity by arm",
+       x = "contraceptive arm", y = "Shannon index") +
+  theme_minimal()
+```
+
+A per-arm summary, so the numbers behind the plot can be read off directly:
+
+```{r qc-alpha-summary}
+alpha_df |>
+  group_by(arm) |>
+  summarise(n = n(), mean_shannon = mean(shannon), sd_shannon = sd(shannon))
+```
+
+## Differential abundance with DESeq2, adjusted for BV
+
+*Reproduced from `group_project/04-differential.qmd`.*
+
+We test which bacterial species differ across the three contraceptive arms
+(pill, injectable, ring) with **DESeq2**. DESeq2 takes **raw counts** — never
+CPM or logged values — and does its own normalisation by estimating a *size
+factor* for each sample (roughly, how deeply that sample was sequenced).
+
+This version adjusts for **bacterial vaginosis (`bv`)**: the design is `~ bv + arm`.
+Writing `bv` first means DESeq2 estimates the arm effects *on top of* any BV
+effect, so a species is called differential only if it differs between arms
+beyond what BV status explains. BV is a strong driver of vaginal species like
+*Lactobacillus* and *Gardnerella*, so this matters here. The `bv` variable has
+three levels (negative, intermediate, positive), with **negative** as the
+reference.
+
+Three things we are careful about:
+
+- **Count matrix orientation**: DESeq2 wants features in *rows* and samples in
+  *columns*, with columns matching the metadata row order. `read_counts()`
+  already guarantees this, and we check it again below.
+- **Zeros**: some samples have so few counts that the default size-factor
+  method fails on geometric means of zeros, so we use `type = "poscounts"`.
+- **Reference level**: DESeq2 compares every arm against the first factor
+  level, so we set **pill** as the reference.
+
+```{r deseq-setup, include=FALSE}
+source(here::here("R/count_tables.R"))
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(DESeq2)
+
+d <- read_counts("group_b")
+meta <- d$metadata
+species <- d$species
+```
+
+### Set up the DESeq2 object
+
+```{r deseq-obj}
+# Counts must be raw integers, features in rows, samples in columns
+stopifnot(identical(colnames(species), meta$sample_id))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(species),          # integer matrix, 220 species x 93 samples
+  colData   = meta,                    # one row per sample
+  design    = ~ bv + arm               # adjust for BV, then test arm
+)
+
+dds$arm <- relevel(dds$arm, ref = "pill")       # arm comparisons are made vs pill
+dds$bv  <- relevel(dds$bv,  ref = "negative")   # bv reference is negative status
+dds <- estimateSizeFactors(dds, type = "poscounts")
+dds <- DESeq(dds)
+resultsNames(dds)   # the bv and arm comparisons DESeq2 built for us
+```
+
+### Results
+
+```{r deseq-results}
+# One results table per contrast, stacked into a single tidy table
+# contrast = c(factor, numerator, denominator) — here both arms vs pill
+contrast_list <- list(
+  "injectable vs pill" = c("arm", "injectable", "pill"),
+  "ring vs pill"       = c("arm", "ring", "pill")
+)
+res_all <- imap(contrast_list, function(contrast, label) {
+  as.data.frame(results(dds, contrast = contrast)) |>
+    tibble::rownames_to_column("species") |>
+    mutate(contrast = label)
+}) |>
+  bind_rows()
+
+write.csv(res_all, here::here("group_project", "Species_Results_bv.csv"), row.names = FALSE)
+
+res_all |>
+  group_by(contrast) |>
+  summarise(
+    species = n(),
+    significant = sum(!is.na(padj) & padj < 0.05),
+    up = sum(!is.na(padj) & padj < 0.05 & log2FoldChange > 0),
+    down = sum(!is.na(padj) & padj < 0.05 & log2FoldChange < 0)
+  )
+```
+
+The full table is saved as `group_project/Species_Results_bv.csv` (both contrasts, one row
+per species per contrast, with log2 fold change, standard error, p-value and
+adjusted p-value).
+
+### Volcano plot
+
+Effect size (log2 fold change) against statistical significance. Species in
+the top corners are both large and significant; the red dashed line is the
+adjusted p < 0.05 cutoff.
+
+```{r deseq-volcano}
+volcano <- res_all |>
+  mutate(significant = !is.na(padj) & padj < 0.05) |>
+  ggplot(aes(log2FoldChange, -log10(padj), colour = significant)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "red") +
+  geom_text(
+    data = ~ filter(.x, significant, abs(log2FoldChange) > 2),
+    aes(label = species), size = 2.6, vjust = -0.5, check_overlap = TRUE
+  ) +
+  scale_colour_manual(values = c("grey60", "firebrick")) +
+  facet_wrap(~ contrast) +
+  labs(title = "Volcano plot — species differential abundance",
+       x = "log2 fold change (vs pill)", y = "-log10 adjusted p-value",
+       colour = "padj < 0.05") +
+  theme_minimal()
+
+volcano
+ggsave(here::here("group_project", "figures", "volcano_species_bv.png"),
+       volcano, width = 9, height = 5, dpi = 300)
+```
+
+### MA plot
+
+Average abundance (baseMean, x) against fold change (log2, y). Species in grey
+were not significant. The spread at low abundance shows why DESeq2 shrinks
+fold changes for thinly-sequenced species rather than trusting them.
+
+```{r deseq-ma}
+ma <- res_all |>
+  mutate(significant = !is.na(padj) & padj < 0.05) |>
+  ggplot(aes(baseMean, log2FoldChange, colour = significant)) +
+  geom_point(alpha = 0.6, size = 1.6) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  scale_x_log10() +
+  scale_colour_manual(values = c("grey60", "firebrick")) +
+  facet_wrap(~ contrast) +
+  labs(title = "MA plot — species differential abundance",
+       x = "mean normalised abundance (log scale)",
+       y = "log2 fold change (vs pill)", colour = "padj < 0.05") +
+  theme_minimal()
+
+ma
+ggsave(here::here("group_project", "figures", "ma_species_bv.png"),
+       ma, width = 9, height = 5, dpi = 300)
+```
+
+### Top hits
+
+The five most significant species in each contrast:
+
+```{r deseq-tophits}
+res_all |>
+  filter(!is.na(padj)) |>
+  group_by(contrast) |>
+  slice_min(padj, n = 5) |>
+  ungroup() |>
+  transmute(contrast, species,
+            log2FC = round(log2FoldChange, 2), padj = signif(padj, 3)) |>
+  knitr::kable()
+```
+
+## Adjusted vs unadjusted design
+
+*New in this compilation.* Two versions of the arm test were run over the
+week: a plain `~ arm` design, saved as `group_project/Species_Results.csv`,
+and the BV-adjusted `~ bv + arm` design saved as
+`group_project/Species_Results_bv.csv`. Comparing them shows what adjusting
+for BV actually changes:
+
+```{r design-compare}
+library(dplyr)
+res_plain <- read.csv(here::here("group_project", "Species_Results.csv"))
+res_bv    <- read.csv(here::here("group_project", "Species_Results_bv.csv"))
+
+summarise_version <- function(df, label) {
+  df |>
+    group_by(contrast) |>
+    summarise(
+      version = label,
+      significant = sum(!is.na(padj) & padj < 0.05),
+      up = sum(!is.na(padj) & padj < 0.05 & log2FoldChange > 0),
+      down = sum(!is.na(padj) & padj < 0.05 & log2FoldChange < 0)
+    )
+}
+
+bind_rows(
+  summarise_version(res_plain, "~ arm (unadjusted)"),
+  summarise_version(res_bv, "~ bv + arm (adjusted)")
+) |>
+  select(version, contrast, significant, up, down) |>
+  knitr::kable()
+```
+
+And the clearest single shift: *Lactobacillus iners*. The unadjusted run gave
+it a raw p of 0.005 in the injectable arm; once BV is in the model the raw p
+rises to 0.020, so part of what looked like an arm effect is explained by BV
+status. Neither design, though, finds any species at adjusted p < 0.05 — see
+the Discussion.
+
+```{r design-compare-iners}
+bind_rows(
+  res_plain |> mutate(version = "unadjusted"),
+  res_bv |> mutate(version = "bv-adjusted")
+) |>
+  filter(species == "lactobacillus_iners", contrast == "injectable vs pill") |>
+  transmute(version, species, log2FC = round(log2FoldChange, 2),
+            pvalue = signif(pvalue, 3), padj = signif(padj, 3)) |>
+  knitr::kable()
+```
+
+**How to check this yourself:** open both CSVs in the file list and filter the
+`contrast` column, or rerun the chunk above after changing the species name —
+every species in the table can be compared the same way.
+
+# Discussion
+
+- The Study B data passed every quality gate: sample IDs agree across all four
+  tables, both sequencing batches contain all three arms, and the metadata is
+  complete. The cytokine table has some missing values, to be dropped
+  analysis-by-analysis, and no samples were excluded from the microbiome or
+  RNA work.
+- Library sizes vary widely; DESeq2 handles this with size factors, and the
+  `poscounts` estimator was needed because species counts contain many zeros.
+- **No species reached adjusted p < 0.05 in either design** (minimum adjusted
+  p: 0.34 unadjusted, 0.163 BV-adjusted). The BV-adjusted run's best species
+  is actually *more* significant than the unadjusted run's, which suggests the
+  adjustment removed noise rather than signal — but with only 93 samples and
+  220 species, the honest reading is that there is no species-level evidence
+  of a contraceptive-arm effect here. Raw p-values did shift (for example
+  *Lactobacillus iners*, 0.005 unadjusted to 0.020 adjusted), so BV and arm
+  do overlap in what they explain.
+- Both count tables are compositional, so all fold changes are relative
+  statements. They should be read alongside the compositional methods (CLR
+  transforms, ordination) from the workshop's other modules.
+- The workshop modules 2–5 (Appendices B–E) are still blank worksheets: the
+  grouping column (`data/my_sample_groups.csv`) and the three DESeq2 result
+  tables they depend on were never saved, so the ordination, the pregnancy
+  cohort differential tests and the enrichment analyses have not been run yet.
+
+# Choices made
+
+Merged from both group project reports.
+
+**Quality control (`01-qc.qmd`)**
+
+- **Sample ID check** used `setequal()` plus an order check, rather than trusting `read_counts()`'s internal `stopifnot()`.
+- **Library sizes** were shown as raw totals per sample; an alternative is relative abundance or rarefaction, which we did not use.
+- **Missing values** were counted per column; we did not impute or drop samples at this stage.
+- **Batch balance** was summarised with a cross-tab and within-arm proportions; no statistical test of balance was run.
+- **Shannon index** was computed on untransformed species counts with `vegan::diversity()`; alternatives include Simpson index or phylogenetic diversity, and microViz's `tax_alpha()` gives the same Shannon values.
+- **No species were pre-filtered** before computing Shannon; low-abundance filtering is a choice to revisit in the main analysis.
+
+**Differential abundance (`04-differential.qmd`)**
+
+- **Design**: `~ bv + arm`; BV is adjusted for because it is a strong driver of vaginal species composition. Alternatives are the simpler `~ arm`, or a richer design also including `nugent` (which is nearly the same information as `bv` and would risk collinearity).
+- **Reference level**: pill; injectable would be DESeq2's default otherwise.
+- **Size factors**: `type = "poscounts"` because species counts contain many zeros; the default geometric-mean method can fail on all-zero samples.
+- **Contrasts**: injectable vs pill and ring vs pill; an alternative is a likelihood-ratio test of the whole arm term at once.
+- **Significance threshold**: adjusted p < 0.05 (Benjamini–Hochberg, DESeq2's default); no fold-change cutoff was added.
+- **No species pre-filtered** before DESeq2; filtering very low-count species is an alternative that changes little here (only 220 species).
+- **Counts were rounded to integers** to satisfy DESeq2's input requirement.
+- **Compositional caveat accepted**: fold changes are interpreted as relative, not absolute, changes.
+
+**Added while compiling**
+
+- The two existing result CSVs were compared side by side (§3.3) rather than
+  only presenting the BV-adjusted version; an alternative would have been to
+  rerun the unadjusted model live instead of reading the saved CSVs.
+- The module worksheets were included unexecuted rather than being filled in
+  or dropped.
+
+# Appendix A — Files produced
+
+Result tables:
+
+- `group_project/Species_Results.csv` — DESeq2, `~ arm` (unadjusted), both contrasts.
+- `group_project/Species_Results_bv.csv` — DESeq2, `~ bv + arm` (adjusted), both contrasts.
+
+Figures in `group_project/figures/`:
+
+- `volcano_species_bv.png` — volcano plot, BV-adjusted run.
+- `ma_species_bv.png` — MA plot, BV-adjusted run.
+- `libsize_genes_vs_species.png`, `libsize_smallest10_species.png` — library-size checks.
+- `volcano_species.png`, `ma_species.png` — the unadjusted run's versions.
+
+# Appendix B — Module 2 worksheet: Count Table Anatomy
+
+*As left in `notebooks/02-count-table-anatomy.qmd`: a template with the
+answer prompts still blank. The code below is shown but not executed here.*
+
+> In this module Pi writes the code. Your job is to ask for numbers and plots,
+> look at each one, and decide what they mean. Ask Pi to put its code under the
+> step you are working on. Every step ends with something for you to check or
+> decide: write your answers here.
+
+```{r m2-setup, eval=FALSE}
+library(tidyverse)
+library(here)
+
+data_dir <- "data/2-workshop2/instructional_dataset"
+
+metadata <- read_csv(here(data_dir, "01_metadata.csv"))
+species  <- read_csv(here(data_dir, "02_microbiome_counts.csv"))    # 220 species  x 471 samples
+genes    <- read_csv(here(data_dir, "04_rnaseq_counts.csv.gz"))     # 14,226 genes x 471 samples
+taxonomy <- read_csv(here(data_dir, "03_microbiome_taxonomy.csv"))
+```
+
+```{r m2-metadata, eval=FALSE}
+metadata
+```
+
+## Exercise 1: Many looks at the same two tables
+
+### Part 1 — Predict (no code)
+
+Answer before running anything below.
+
+**1. Of the 220 species, how many will you see in a single sample?**
+
+- *Your answer:*
+
+**2. Of the 14,226 genes, how many will you see in a single sample?**
+
+- *Your answer:*
+
+**3. Which table has a larger share of zero cells?**
+
+- *Your answer:*
+
+**4. One sample has 438 bacterial reads against a median of about 28,700. What will be wrong with it?**
+
+- *Your answer:*
+
+**5. A typical sample behaves like how many equally common species? Like how many equally expressed genes?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: the per-sample numbers
+
+Suggested request: *In step 1 of my notebook, make one data frame with a row
+for every sample in each count table, species and genes, and a `table` column
+saying which. Columns: library size, number of features detected, fraction of
+zeros, the share held by the largest feature, Shannon diversity, and the
+effective number of features.*
+
+- Does it have 942 rows, 471 for each table?
+  - *Your answer:*
+- Type `sum(species$P001_week_18)` in the console. Does it match Pi's library size for that sample?
+  - *Your answer:*
+- Is features detected never more than 220 (species) or 14,226 (genes)?
+  - *Your answer:*
+
+#### Step 2: a short report
+
+Suggested request: *Under that data frame, add a summary table with the median,
+smallest and largest value of every column, separately for each table. Then
+write three sentences about anything unusual.*
+
+- Which medians were furthest from your Part 1 answers?
+  - *Your answer:*
+- Did Pi mention the 438-read sample? Did it claim anything you cannot find in the table?
+  - *Your answer:*
+
+#### Step 3: one number, four plots
+
+Suggested request: *Plot the library size of every sample four ways: a
+histogram, the same histogram on a log scale, the samples ranked from smallest
+to largest, and library size by visit. Use both tables.*
+
+- Which view makes the 438-read sample obvious, and which hides it? Which would you put in a paper?
+  - *Your answer:*
+
+#### Step 4: features detected against library size
+
+From here on, write your own requests. Ask for the plot and the Spearman
+correlation for each table, then ask how many extra genes the correlation
+amounts to between the shallowest and the deepest samples.
+
+- How many extra genes, out of 14,226? Does the plot agree with Pi?
+  - *Your answer:*
+
+#### Step 5: which samples to drop
+
+Ask Pi to suggest a minimum library size and explain it. Then ask how many
+samples cutoffs of 1,000, 5,000, 10,000 and 20,000 reads would drop, and from
+which visits and outcomes.
+
+*The cutoff I chose, and why:*
+
+- When you asked what happens if you keep the dropped samples, did Pi's answer agree with its first reason?
+  - *Your answer:*
+
+#### Step 6: polish one figure
+
+Improve one plot a request at a time: axis titles in words, log-axis labels
+like 1k and 10k, your own two colours, text readable from the back of the room,
+saved as a 6 by 4 inch PNG. Then ask for one thing you would not know how to
+code yourself.
+
+- Which request got you furthest? How did "make it look nicer" compare with a specific request?
+  - *Your answer:*
+
+#### Step 7: argue with it
+
+Ask which logarithm `log()` is in R, then what the effective number would be if
+the Shannon formula used `log2()`.
+
+- Did the effective number change? Did Pi say it would?
+  - *Your answer:*
+
+## Exercise 2: Filters are choices
+
+Type `/new` in Pi before you start. Step 5 builds a file that this afternoon's
+notebook reads. If you are short on time, do step 5 first.
+
+### Part 1 — Predict (no code)
+
+**1. Keeping only species present in at least 10% of samples: how many of the 220 survive, and what share of reads is lost?**
+
+- *Your answer:*
+
+**2. The same 10% rule applied to 14,226 genes: how many survive?**
+
+- *Your answer:*
+
+**3. To compare one species between two samples, what must you do to the counts first?**
+
+- *Your answer:*
+
+**4. If you drop the rare species, does the effective number of species in a sample go up, go down, or stay about the same?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: prevalence and the filter curve
+
+Ask for each feature's prevalence in both tables and its distribution, then the
+filter curve: for cutoffs from 0 to 0.9, features kept and share of counts kept.
+
+- At 10%, does the species table keep 59 of 220 and lose about 0.8% of reads? Does the gene table keep all 14,226?
+  - *Your answer:*
+
+#### Step 2: a grid of filters
+
+Ask for features kept and share of counts kept for every combination, as one
+summary table and then as a plot:
+
+- species: prevalence 5%, 10% or 25%, crossed with mean relative abundance 0, 0.01% or 0.1%
+- genes: mean CPM 1, 5 or 10, crossed with prevalence 0%, 50% or 90%
+
+*Why I filtered the species table this way:*
+
+*Why I filtered the gene table this way:*
+
+- What did your neighbour choose?
+  - *Your answer:*
+
+#### Step 3: did the filter change anything you care about?
+
+Ask for each sample's effective number of species before and after your filter,
+as a scatter plot with a 1:1 line. Then the same for features detected.
+
+- Which number moved, and why did the other barely move?
+  - *Your answer:*
+
+#### Step 4: normalise, then log
+
+Ask for counts per million and `log2(cpm + 1)`, histograms of one species and
+one gene before and after the log, then the same gene with `+ 0.5`, `+ 1` and
+`+ 10`.
+
+- Where does the `+ 1` change the picture, and where does it make no difference?
+  - *Your answer:*
+
+#### Step 5: THE IMPORTANT ONE, the grouping column
+
+Suggested request: *From the full species table, before any filtering, compute
+the fraction of each sample's reads that belong to the genus Lactobacillus. Use
+`03_microbiome_taxonomy.csv` to find which species those are. Add a column
+called `community` that is `lactobacillus` if the fraction is 0.5 or more and
+`anaerobe` if it is below 0.5. Save `sample_id`, `lacto_fraction` and
+`community` to `data/my_sample_groups.csv`.*
+
+This afternoon's notebook reads that file back, and so does Wednesday's.
+
+- Which species names did Pi count as Lactobacillus? Should any of them not be there?
+  - *Your answer:*
+- Smallest and largest `lacto_fraction`? Both should be between 0 and 1.
+  - *Your answer:*
+- One sample's Lactobacillus counts divided by its total, worked out by you. Does it match?
+  - *Your answer:*
+
+#### Step 6: the 0.5 cutoff
+
+Ask for a histogram of `lacto_fraction` with a line at 0.5, how many samples
+change group at 0.3 or 0.8, and how the split across visits changes. Then ask
+Pi to justify 0.5.
+
+- Is its reason about this data, or would it say the same about any dataset?
+  - *Your answer:*
+
+#### Step 7: diversity by community
+
+Ask for the effective number of species in each community group, as a boxplot
+on a log scale.
+
+- Which group is more diverse? Is that what you would call healthy?
+  - *Your answer:*
+
+#### Step 8: bar charts and heatmaps
+
+Ask for the microViz bar chart of the 10 largest genera and a heatmap of the 20
+largest with `community` as a strip along the top, then the same for genes by
+gene symbol. Then ask for variations: bars ordered by `lacto_fraction`, split by
+community, 20 genera instead of 10.
+
+- Which version tells you the most?
+  - *Your answer:*
+- Two genes whose heatmap rows look alike, and what they do (check one on NCBI Gene yourself):
+  - *Your answer:*
+
+### Part 3 — Reach (optional)
+
+Ask Pi to turn this notebook into a short QC report as a new Quarto document,
+ending in `## Choices made` with every cutoff and filter you chose and one
+alternative for each. Render it. Then ask Pi to run the same report on
+`group_a_probiotic` or `group_b_contraception`, changing only the data folder.
+
+- Is every choice you made today in the Choices made list? Did the report need more changes than the data folder?
+  - *Your answer:*
+
+# Appendix C — Module 3 worksheet: Distances and Ordination
+
+*As left in `notebooks/03-ordination.qmd`: a template with the answer prompts
+still blank. The code below is shown but not executed here.*
+
+> Pi writes the code and you decide what it means. Ask it to use `ps_species`
+> and `ps_genes` from the setup chunk. The pipeline it will use has three knobs:
+> `tax_transform() |> dist_calc() |> ord_calc("PCoA") |> ord_plot()`
+
+```{r m3-setup, eval=FALSE}
+library(tidyverse)
+library(here)
+library(microViz)
+library(phyloseq)
+
+source(here("R/count_tables.R"))
+
+# The grouping you built and saved in notebook 02. If it is not there yet, this
+# stops with a clear message instead of a confusing one.
+groups_file <- here("data/my_sample_groups.csv")
+if (!file.exists(groups_file)) {
+  stop("Could not find ", groups_file,
+       "\nGo back to notebook 02, Exercise 2, step 5 and save your per-sample ",
+       "table with the `community` column. Or rebuild it here: the Lactobacillus ",
+       "fraction from the species table, split at 0.5.", call. = FALSE)
+}
+sample_groups <- read_csv(groups_file)
+
+# as_counts() builds a phyloseq object from either count table. For the gene
+# table it hands microViz the gene annotation as the rank table, which is why
+# every microViz verb below works on genes.
+ps_species <- as_counts(table = "microbiome")
+ps_genes   <- as_counts(table = "rnaseq", min_count = 10, min_samples = 100)
+```
+
+```{r m3-print, eval=FALSE}
+ps_species
+ps_genes
+```
+
+```{r m3-groups, eval=FALSE}
+# Add your community column to both objects so you can colour by it.
+add_groups <- function(ps) {
+  sd <- as(sample_data(ps), "data.frame") |>
+    rownames_to_column("sid") |>
+    left_join(sample_groups |> select(sample_id, community, lacto_fraction),
+              by = c("sid" = "sample_id")) |>
+    column_to_rownames("sid")
+  sample_data(ps) <- sample_data(sd)
+  ps
+}
+
+ps_species <- add_groups(ps_species)
+ps_genes   <- add_groups(ps_genes)
+```
+
+## Exercise 1: The species table
+
+### Part 1 — Predict (no code)
+
+**1. Our species table is about 89% zeros. Will Bray-Curtis or Jaccard separate the community types more clearly?**
+
+- *Your answer:*
+
+**2. Shuffling `outcome` randomly across 471 samples, what R2 would PERMANOVA report?**
+
+- *Your answer:*
+
+**3. Where will the 438-read sample sit in a Bray-Curtis ordination?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: the first ordination
+
+Suggested request: *Using `ps_species` from the setup chunk, make a Bray-Curtis
+PCoA with microViz at the species level and colour it by `community`. Put the
+share of variation on each axis title.*
+
+- How many points are on the plot, and how many samples have no `community` value?
+  - *Your answer:*
+
+#### Step 2: three distances, side by side
+
+Suggested request: *Make the same ordination three ways, side by side:
+`"identity"` with `"bray"`, `"binary"` with `"jaccard"`, and `"clr"` with
+`"euclidean"`. Under them, add a scree plot for each showing the share of
+variation held by the first eight axes.*
+
+*The distance I would publish, and why:*
+
+#### Step 3: one plot, many colourings
+
+Ask for the Bray-Curtis ordination as a grid of panels coloured by `outcome`,
+`time_point`, `nugent`, `lacto_fraction` and library size.
+
+- Which colouring lines up with axis 1? Which shows nothing by eye?
+  - *Your answer:*
+
+#### Step 4: what is axis 1?
+
+From here on, write your own requests. Ask Pi to interpret the ordination, then
+ask for the numbers behind it: the correlation of axis 1 with `lacto_fraction`,
+and the five genera that track axis 1 most closely.
+
+- Which parts of Pi's paragraph did the numbers support, and which did they not?
+  - *Your answer:*
+
+#### Step 5: PERMANOVA and a null distribution
+
+Ask for the R2 and p-value of `community`, `outcome`, `time_point` and
+`rnaseq_batch`. Then shuffle `outcome` 20 times, run PERMANOVA on each with 99
+permutations, and plot the 20 R2 values with the real one marked.
+
+- Do the R2 values match the slides (about 17.5%, 8.7%, 0.5%, and nothing for batch)?
+  - *Your answer:*
+- Where does the real outcome R2 sit among the shuffled ones?
+  - *Your answer:*
+
+#### Step 6: argue about the settings
+
+Ask for `by = "margin"` and `by = "terms"` side by side, and why they differ.
+Then ask whether PERMANOVA knows each participant appears three times.
+
+- Explain the answer in your own words:
+  - *Your answer:*
+
+#### Step 7: the 438-read sample
+
+Ask Pi to label it on the plot, then redraw without the samples you dropped this
+morning, side by side with the original.
+
+- Was your prediction right? Did anything else move?
+  - *Your answer:*
+
+#### Step 8: polish one figure
+
+Ask for variations of the community plot: ellipses, one panel per visit, point
+size by library size, lines joining each participant's visits for ten
+participants. Keep the best and make it ready for a talk.
+
+- Which variation showed you the most?
+  - *Your answer:*
+
+## Exercise 2: The identical pipeline on 14,000 genes
+
+Type `/new` in Pi before you start.
+
+### Part 1 — Predict (no code)
+
+**1. Would you use Bray-Curtis on gene counts? Why or why not?**
+
+- *Your answer:*
+
+**2. `community` explained about 18% of the species table. What share of the gene table?**
+
+- *Your answer:*
+
+**3. What share will `rnaseq_batch` explain?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: the gene ordination
+
+Suggested request: *Using `ps_genes` from the setup chunk, make a CLR plus
+Euclidean PCoA at the `symbol` level, as three panels coloured by `community`,
+`outcome` and `rnaseq_batch`.*
+
+- How many genes are in `ps_genes`? What pseudocount did CLR use, and where did that number come from?
+  - *Your answer:*
+
+#### Step 2: species and genes side by side
+
+Ask for PERMANOVA on the gene ordination with the same four labels, and a table
+and bar chart of species and gene R2 values together.
+
+- Do community, outcome and batch each explain about 2% of the gene table?
+  - *Your answer:*
+
+#### Step 3: a report, audited
+
+Ask Pi for a paragraph comparing the two tables. Mark each sentence as backed by
+a number or not.
+
+- Which sentences had no number behind them?
+  - *Your answer:*
+- What do you expect tomorrow's gene-by-gene tests to find?
+  - *Your answer:*
+
+#### Step 4: is batch tangled up with the biology?
+
+Ask for `rnaseq_batch` against `outcome`, `community` and `time_point`, and
+whether each participant's visits all fall in one batch.
+
+- What did you find, and what would an imbalance mean for tomorrow's tests?
+  - *Your answer:*
+
+#### Step 5: two ways to handle batch
+
+Ask for PERMANOVA with batch entered before outcome (`by = "terms"`), next to
+outcome alone. Then ask Pi to remove the batch effect using only installed
+packages, redraw before and after, and say exactly what it did to the numbers.
+
+- Did the outcome R2 change when batch was in the model?
+  - *Your answer:*
+- Which kind of batch correction did Pi use? Could it have removed outcome signal too?
+  - *Your answer:*
+
+#### Step 6: other choices, side by side
+
+Ask for Bray-Curtis on genes, and CLR with a looser and a stricter gene filter,
+next to your CLR version.
+
+- Which differences would change your conclusions, and which are cosmetic?
+  - *Your answer:*
+
+#### Step 7: one figure for a talk
+
+Species and gene ordinations side by side, the same two community colours, one
+shared legend, community R2 in each subtitle.
+
+### Part 3 — Reach (optional)
+
+Ask for gene axis 1 against species axis 1 for the same samples, with the
+correlation, then axis 2 against axis 2. Then, if there is time, a short Quarto
+report ending in `## Choices made`.
+
+- Are the two tables related?
+  - *Your answer:*
+
+# Appendix D — Module 4 worksheet: Differential Testing
+
+*As left in `notebooks/04-differential.qmd`: a template with the answer
+prompts still blank. The code below is shown but not executed here.*
+
+> Raw counts go into DESeq2. Never CPM, never logged. The method does its own
+> normalisation and feeding it normalised data breaks it.
+>
+> Pi writes the code and you decide what it means. Ask it to use `d` and
+> `metadata` from the setup chunk, and to put its code under the step you are
+> working on.
+
+```{r m4-setup, eval=FALSE}
+library(tidyverse)
+library(here)
+library(DESeq2)
+
+source(here("R/count_tables.R"))
+
+d <- read_counts("instructional")
+
+# The grouping you built and saved in notebook 02. If it is not there yet, this
+# stops with a clear message instead of a confusing one.
+groups_file <- here("data/my_sample_groups.csv")
+if (!file.exists(groups_file)) {
+  stop("Could not find ", groups_file,
+       "\nGo back to notebook 02, Exercise 2, step 5 and save your per-sample ",
+       "table with the `community` column. Or rebuild it here: the Lactobacillus ",
+       "fraction from the species table, split at 0.5.", call. = FALSE)
+}
+sample_groups <- read_csv(groups_file)
+
+metadata <- d$metadata |> left_join(sample_groups, by = "sample_id")
+```
+
+```{r m4-count, eval=FALSE}
+count(metadata, time_point, community)
+```
+
+## Exercise 1: Test the gene table with a grouping from the species table
+
+### Part 1 — Predict (no code)
+
+**1. Testing 13,738 genes, how many get a raw p-value below 0.05 if nothing is truly different?**
+
+- *Your answer:*
+
+**2. Would you rather have 157 samples at one visit, or 471 across three visits? Why?**
+
+- *Your answer:*
+
+**3. Will more significant genes be higher in anaerobe-dominant or Lactobacillus-dominant samples?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: set up and run the test
+
+Suggested request: *Using `d` and `metadata` from the setup chunk, keep only
+the week 18 samples. Keep genes with a count of at least 10 in at least a
+quarter of those samples. Run DESeq2 on the raw counts with `~ community` and
+the contrast anaerobe against lactobacillus. Add gene symbols and names from
+`d$gene_info`. Save the results table to `data/genes_by_community.csv` with the
+columns `feature` (the Ensembl ID), `baseMean`, `log2FoldChange`, `lfcSE`,
+`stat`, `pvalue`, `padj`, `symbol` and `gene_name`.*
+
+Tomorrow's notebook reads that file.
+
+- Samples in each group (37 and 120)? Genes tested (13,738)?
+  - *Your answer:*
+- Do the first five count-table columns match the first five `sample_id` values, in order?
+  - *Your answer:*
+
+#### Step 2: a short report
+
+Suggested request: *Write a summary of the results: how many genes have
+`pvalue` below 0.05, how many have `padj` below 0.05, how many of those change
+more than two-fold, and how many go each way. Then list the top 20 genes by
+`padj` with symbol, name and fold change.*
+
+- Do you get 1,815 at `padj` below 0.05 and 303 of those more than two-fold?
+  - *Your answer:*
+- What do the top 20 genes have in common?
+  - *Your answer:*
+
+#### Step 3: one result, four plots
+
+From here on, write your own requests. Volcano plot, MA plot, raw p-value
+histogram with the no-difference line, boxplots of the top six genes by
+community.
+
+- Pi's explanation of the sign convention:
+  - *Your answer:*
+- Does every boxplot agree with the sign of its fold change?
+  - *Your answer:*
+
+#### Step 4: cutoffs are choices
+
+Genes passing at `padj` 0.01, 0.05, 0.1 crossed with fold change 0, 1.5, 2, 4.
+Then the test with a looser (10%) and a stricter (50%) gene filter.
+
+*The cutoffs I would report, and why:*
+
+#### Step 5: argue with it
+
+Ask Pi to rerun on counts per million, then whether you should have used all
+471 samples.
+
+- What happened with counts per million, and why is it wrong?
+  - *Your answer:*
+- What did Pi say about using all 471 samples?
+  - *Your answer:*
+
+#### Step 6: polish the volcano plot
+
+Top ten genes labelled, your own colours, direction in words under the x axis,
+dashed cutoff lines, saved as a PNG.
+
+## Exercise 2: The same test, on the species table
+
+Type `/new` in Pi before you start. Steps 3 and 5 each save a file that
+tomorrow's notebook reads.
+
+### Part 1 — Predict (no code)
+
+**1. Why can you not test the species table with the `community` column you built from it?**
+
+- *Your answer:*
+
+**2. How many of the 220 species survive "present in at least 10% of samples"? How many of those are present in all 157 samples?**
+
+- *Your answer:*
+
+**3. If any species are significant, will they be higher in preterm or in term?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: the default run
+
+Suggested request: *Using `d` and `metadata` from the setup chunk, keep the
+week 18 samples and the species present in at least 10% of them. Run DESeq2 on
+the raw counts with `~ outcome` and the contrast preterm against term, with the
+default settings. Add `Genus` and `Family` from `d$taxonomy`, and list the
+significant species with their fold changes.*
+
+- Species tested (53) and significant (19)? Do the names look like what you would expect?
+  - *Your answer:*
+
+#### Step 2: look behind it
+
+Which species have no zero in any sample? Size factor against *L. iners* share,
+and against library size, both on log scales.
+
+- What are the size factors measuring?
+  - *Your answer:*
+
+#### Step 3: alternatives side by side
+
+Rerun with `type = "poscounts"` size factors and compare the two runs in one
+table. Save the poscounts version to `data/species_by_outcome.csv` with columns
+`feature`, `baseMean`, `log2FoldChange`, `lfcSE`, `stat`, `pvalue`, `padj`,
+`Genus` and `Family`.
+
+*Why the first list, which looked right, was not:*
+
+#### Step 4: many views of a null result
+
+Top ten species by `padj`, then the top three by outcome as log-scale boxplots,
+as presence in each group, and across all three visits.
+
+- How many of the top ten lean toward preterm? Did the two names you checked exist in `d$taxonomy`?
+  - *Your answer:*
+- Which view is most honest about how weak the signal is?
+  - *Your answer:*
+
+#### Step 5: the gene table against outcome
+
+The `~ outcome` test on genes, saved to `data/genes_by_outcome.csv`. Then one
+table comparing all three tests, and the two gene volcano plots side by side.
+
+- Do you get 1,698 significant, and 50 more than two-fold?
+  - *Your answer:*
+
+*What the comparison tells me about where the outcome signal lives:*
+
+#### Step 6: argue with it
+
+Is DESeq2 appropriate for microbiome counts? Then the opposite case. Then the
+gene test grouped by Nugent score of 7 or more.
+
+- Which argument was stronger?
+  - *Your answer:*
+- Did Pi tell you it dropped samples for the Nugent grouping, and how many it kept?
+  - *Your answer:*
+
+### Part 3 — Reach (optional)
+
+Species against outcome on all 471 samples, compared with your 157-sample
+result. Then, if there is time, a short Quarto report ending in
+`## Choices made`.
+
+- More samples gave more hits. Are they real? What assumption did you break?
+  - *Your answer:*
+
+# Appendix E — Module 5 worksheet: Sets and Enrichment
+
+*As left in `notebooks/05-enrichment.qmd`: a template with the answer prompts
+still blank. The code below is shown but not executed here.*
+
+> A list of 1,698 gene names is not a finding. Today you turn one into a
+> sentence, and then check whether the sentence is real.
+>
+> Pi writes the code and you decide what it means. Ask it to use the three
+> result tables from the setup chunk, and to put its code under the step you are
+> working on.
+
+```{r m5-setup, eval=FALSE}
+library(tidyverse)
+library(here)
+library(fgsea)
+library(msigdbr)
+
+source(here("R/count_tables.R"))
+
+d <- read_counts("instructional")
+
+# The three result tables you saved in notebook 04. If one is missing, this
+# stops and tells you which step of notebook 04 makes it.
+read_result <- function(file, where) {
+  path <- here("data", file)
+  if (!file.exists(path)) {
+    stop("Could not find ", path, "\nGo back to notebook 04, ", where,
+         ", and ask Pi to save the results table there.", call. = FALSE)
+  }
+  read_csv(path, show_col_types = FALSE)
+}
+
+genes_by_outcome   <- read_result("genes_by_outcome.csv",   "Exercise 2, step 5")
+genes_by_community <- read_result("genes_by_community.csv", "Exercise 1, step 1")
+species_by_outcome <- read_result("species_by_outcome.csv", "Exercise 2, step 3")
+```
+
+```{r m5-nrow, eval=FALSE}
+# Each should have one row per feature and a `stat` column.
+nrow(genes_by_outcome)
+nrow(genes_by_community)
+nrow(species_by_outcome)
+```
+
+## Exercise 1: From a gene list to a sentence
+
+### Part 1 — Predict (no code)
+
+**1. Testing 50 gene sets, how many come out at padj < 0.05 if none are truly enriched?**
+
+- *Your answer:*
+
+**2. Your outcome gene list was 838 up and 860 down, almost balanced. Does that make you more or less willing to believe an enrichment?**
+
+- *Your answer:*
+
+**3. Name one biological program you expect elevated in the people who delivered preterm.**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: run the enrichment
+
+Suggested request: *Using `genes_by_outcome` from the setup chunk, make a
+ranking vector from `stat`, named by the Ensembl ID in `feature`, with missing
+values dropped. Get the human Hallmark sets with msigdbr, using Ensembl IDs.
+Run `fgsea(sets, stat, minSize = 15, maxSize = 500)` and sort by `padj`.*
+
+- Genes in the ranking, and how many of them appear in at least one set?
+  - *Your answer:*
+- Sets significant, and how many point each way (26, with 23 higher in preterm)?
+  - *Your answer:*
+
+#### Step 2: one result, several plots
+
+Bar chart of the top twelve `NES`, running-score plot for the top set, dot plot
+of all 50 sets.
+
+- Which would you put in a paper? Which tells you most about how the method works?
+  - *Your answer:*
+
+#### Step 3: a report, audited
+
+From here on, write your own requests. Ask Pi to interpret the top five sets,
+then for a table of genes shared between each pair.
+
+- Which of Pi's findings were the same genes counted twice?
+  - *Your answer:*
+
+#### Step 4: could the ranking have done this on its own?
+
+Ask Pi first, then run the same enrichment on `genes_by_community` and compare:
+genes up and down, sets significant and pointing one way, and the share of
+positive statistics among all genes, significant genes, and the 500 strongest.
+
+- Did Pi check, or just reassure you?
+  - *Your answer:*
+- About 50% (outcome) and about 4% (community) positive among the 500 strongest?
+  - *Your answer:*
+
+*Which of the two enrichment results I trust, and why:*
+
+#### Step 5: alternatives side by side
+
+The hypergeometric version on significant genes only, up and down separately,
+and fgsea on Reactome (`C2`, `CP:REACTOME`), next to your Hallmark result.
+
+- Where do they agree? Where they disagree, which threw away information?
+  - *Your answer:*
+
+#### Step 6: look at the genes
+
+Leading edge of the top set as gene symbols, then counts per million for two of
+them at week 18 by outcome.
+
+- Does the plot look like the effect the enrichment describes?
+  - *Your answer:*
+
+#### Step 7: polish one figure
+
+The `NES` bar chart for a talk: readable set names, colours labelled by
+direction, set size shown, projector-sized text.
+
+## Exercise 2: The same function, on 53 species
+
+Type `/new` in Pi before you start.
+
+### Part 1 — Predict (no code)
+
+**1. A gene set holds about 200 genes; a genus holds 2 to 12 species. What does that do to your power?**
+
+- *Your answer:*
+
+**2. Which genus do you expect associated with preterm birth?**
+
+- *Your answer:*
+
+**3. Does testing 10 genus sets need as aggressive a correction as 50 gene sets?**
+
+- *Your answer:*
+
+### Part 2 — Ask, look, decide
+
+#### Step 1: build the sets and run it
+
+Suggested request: *Using `species_by_outcome` from the setup chunk, make a
+ranking vector from `stat`, named by `feature`. Build one set per genus from the
+`Genus` column, keeping genera with at least two species. Run
+`fgsea(genus_sets, species_stat, minSize = 2, maxSize = 50)` and sort by
+`padj`.*
+
+- Number of sets (10), size of the largest (12)? Any species in two sets? A set called `NA`?
+  - *Your answer:*
+- Which genus is on top, and does anything pass?
+  - *Your answer:*
+
+#### Step 2: family instead of genus
+
+- Does the top family contain the top genus? Do the two levels agree?
+  - *Your answer:*
+
+#### Step 3: the simple way
+
+The 53 species sorted by `stat` with their genus, as a table and as a plot.
+
+- Would you have reached the same conclusion without enrichment?
+  - *Your answer:*
+
+#### Step 4: argue with it
+
+Was enrichment useful on the species table? Then the opposite case.
+
+- Which argument is stronger?
+  - *Your answer:*
+
+#### Step 5: when is set-based analysis worth doing?
+
+*For which of our two tables was it worth doing, and what feature of the table decides that:*
+
+### Part 3 — Reach (optional)
+
+Hand-built functional sets: Lactobacillus or not, strict anaerobe or not, on a
+published BV-associated list or not. Read every set Pi makes.
+
+- Where did Pi get the information for each set, and could you check it?
+  - *Your answer:*
+
+# Appendix F — Module 0: environment check
+
+*From `notebooks/00-hello-r.qmd`, executed here to prove the environment works.*
+
+Welcome! This is your very first notebook. If you can see a chart appear when
+you run the code below, your environment is working and you are ready to go.
+
+```{r hello-r}
+library(tidyverse)
+library(palmerpenguins)
+
+ggplot(penguins, aes(x = flipper_length_mm, y = body_mass_g, color = species)) +
+  geom_point() +
+  labs(
+    title = "Penguin flipper length vs. body mass",
+    x = "Flipper length (mm)",
+    y = "Body mass (g)",
+    color = "Species"
+  )
+```

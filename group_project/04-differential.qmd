@@ -1,0 +1,186 @@
+---
+title: "Study B — Differential abundance with DESeq2"
+subtitle: "Species counts across the three contraceptive arms, adjusted for BV"
+format: html
+editor: visual
+---
+
+We test which bacterial species differ across the three contraceptive arms
+(pill, injectable, ring) with **DESeq2**. DESeq2 takes **raw counts** — never
+CPM or logged values — and does its own normalisation by estimating a *size
+factor* for each sample (roughly, how deeply that sample was sequenced).
+
+This version adjusts for **bacterial vaginosis (`bv`)**: the design is `~ bv + arm`.
+Writing `bv` first means DESeq2 estimates the arm effects *on top of* any BV
+effect, so a species is called differential only if it differs between arms
+beyond what BV status explains. BV is a strong driver of vaginal species like
+*Lactobacillus* and *Gardnerella*, so this matters here. The `bv` variable has
+three levels (negative, intermediate, positive), with **negative** as the
+reference.
+
+Three things we are careful about:
+
+- **Count matrix orientation**: DESeq2 wants features in *rows* and samples in
+  *columns*, with columns matching the metadata row order. `read_counts()`
+  already guarantees this, and we check it again below.
+- **Zeros**: some samples have so few counts that the default size-factor
+  method fails on geometric means of zeros, so we use `type = "poscounts"`.
+- **Reference level**: DESeq2 compares every arm against the first factor
+  level, so we set **pill** as the reference.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8)
+source(here::here("R/count_tables.R"))
+library(dplyr)
+library(purrr)
+library(ggplot2)
+library(DESeq2)
+
+d <- read_counts("group_b")
+meta <- d$metadata
+species <- d$species
+```
+
+## Set up the DESeq2 object
+
+```{r}
+# Counts must be raw integers, features in rows, samples in columns
+stopifnot(identical(colnames(species), meta$sample_id))
+
+dds <- DESeqDataSetFromMatrix(
+  countData = round(species),          # integer matrix, 220 species x 93 samples
+  colData   = meta,                    # one row per sample
+  design    = ~ bv + arm               # adjust for BV, then test arm
+)
+
+dds$arm <- relevel(dds$arm, ref = "pill")       # arm comparisons are made vs pill
+dds$bv  <- relevel(dds$bv,  ref = "negative")   # bv reference is negative status
+dds <- estimateSizeFactors(dds, type = "poscounts")
+dds <- DESeq(dds)
+resultsNames(dds)   # the bv and arm comparisons DESeq2 built for us
+```
+
+## Results
+
+```{r}
+# One results table per contrast, stacked into a single tidy table
+# contrast = c(factor, numerator, denominator) — here both arms vs pill
+contrast_list <- list(
+  "injectable vs pill" = c("arm", "injectable", "pill"),
+  "ring vs pill"       = c("arm", "ring", "pill")
+)
+res_all <- imap(contrast_list, function(contrast, label) {
+  as.data.frame(results(dds, contrast = contrast)) |>
+    tibble::rownames_to_column("species") |>
+    mutate(contrast = label)
+}) |>
+  bind_rows()
+
+write.csv(res_all, "Species_Results_bv.csv", row.names = FALSE)
+
+res_all |>
+  group_by(contrast) |>
+  summarise(
+    species = n(),
+    significant = sum(!is.na(padj) & padj < 0.05),
+    up = sum(!is.na(padj) & padj < 0.05 & log2FoldChange > 0),
+    down = sum(!is.na(padj) & padj < 0.05 & log2FoldChange < 0)
+  )
+```
+
+The full table is saved as `Species_Results_bv.csv` (both contrasts, one row
+per species per contrast, with log2 fold change, standard error, p-value and
+adjusted p-value).
+
+## Volcano plot
+
+Effect size (log2 fold change) against statistical significance. Species in
+the top corners are both large and significant; the red dashed line is the
+adjusted p < 0.05 cutoff.
+
+```{r}
+volcano <- res_all |>
+  mutate(significant = !is.na(padj) & padj < 0.05) |>
+  ggplot(aes(log2FoldChange, -log10(padj), colour = significant)) +
+  geom_point(alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "red") +
+  geom_text(
+    data = ~ filter(.x, significant, abs(log2FoldChange) > 2),
+    aes(label = species), size = 2.6, vjust = -0.5, check_overlap = TRUE
+  ) +
+  scale_colour_manual(values = c("grey60", "firebrick")) +
+  facet_wrap(~ contrast) +
+  labs(title = "Volcano plot — species differential abundance",
+       x = "log2 fold change (vs pill)", y = "-log10 adjusted p-value",
+       colour = "padj < 0.05") +
+  theme_minimal()
+
+volcano
+ggsave("figures/volcano_species_bv.png", volcano, width = 9, height = 5, dpi = 300)
+```
+
+## MA plot
+
+Average abundance (baseMean, x) against fold change (log2, y). Species in grey
+were not significant. The spread at low abundance shows why DESeq2 shrinks
+fold changes for thinly-sequenced species rather than trusting them.
+
+```{r}
+ma <- res_all |>
+  mutate(significant = !is.na(padj) & padj < 0.05) |>
+  ggplot(aes(baseMean, log2FoldChange, colour = significant)) +
+  geom_point(alpha = 0.6, size = 1.6) +
+  geom_hline(yintercept = 0, colour = "grey30") +
+  scale_x_log10() +
+  scale_colour_manual(values = c("grey60", "firebrick")) +
+  facet_wrap(~ contrast) +
+  labs(title = "MA plot — species differential abundance",
+       x = "mean normalised abundance (log scale)",
+       y = "log2 fold change (vs pill)", colour = "padj < 0.05") +
+  theme_minimal()
+
+ma
+ggsave("figures/ma_species_bv.png", ma, width = 9, height = 5, dpi = 300)
+```
+
+## Top hits
+
+The five most significant species in each contrast:
+
+```{r}
+res_all |>
+  filter(!is.na(padj)) |>
+  group_by(contrast) |>
+  slice_min(padj, n = 5) |>
+  ungroup() |>
+  transmute(contrast, species,
+            log2FC = round(log2FoldChange, 2), padj = signif(padj, 3)) |>
+  knitr::kable()
+```
+
+## Caveat
+
+Both count tables in this dataset are **compositional**: sequencing depth per
+sample is fixed, so "less of species X" can also mean "more of everything
+else". DESeq2 models counts as if total reads were free to vary, so treat its
+fold changes as relative statements, and read them alongside the
+compositional methods (CLR transforms, ordination) from the other modules.
+
+## Choices made
+
+- **Design**: `~ bv + arm`; BV is adjusted for because it is a strong driver
+  of vaginal species composition. Alternatives are the simpler `~ arm`, or a
+  richer design also including `nugent` (which is nearly the same information
+  as `bv` and would risk collinearity).
+- **Reference level**: pill; injectable would be DESeq2's default otherwise.
+- **Size factors**: `type = "poscounts"` because species counts contain many
+  zeros; the default geometric-mean method can fail on all-zero samples.
+- **Contrasts**: injectable vs pill and ring vs pill; an alternative is
+  a likelihood-ratio test of the whole arm term at once.
+- **Significance threshold**: adjusted p < 0.05 (Benjamini–Hochberg, DESeq2's
+  default); no fold-change cutoff was added.
+- **No species pre-filtered** before DESeq2; filtering very low-count species
+  is an alternative that changes little here (only 220 species).
+- **Counts were rounded to integers** to satisfy DESeq2's input requirement.
+- **Compositional caveat accepted**: fold changes are interpreted as relative,
+  not absolute, changes.

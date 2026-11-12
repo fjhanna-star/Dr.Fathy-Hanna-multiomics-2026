@@ -1,0 +1,162 @@
+---
+title: "Study B — QC report"
+subtitle: "Contraceptive methods study (group_b), 93 samples"
+format: html
+editor: visual
+---
+
+This report checks the Study B data before any real analysis. We look at five things: that the sample IDs agree across all the tables, how big each library is (the total reads per sample), where values are missing, whether the two sequencing batches are spread evenly across the three arms, and Shannon alpha diversity as a first look at the microbiome data.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 8)
+source(here::here("R/count_tables.R"))
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(vegan)
+
+d <- read_counts("group_b")
+meta <- d$metadata
+species <- d$species
+genes <- d$genes
+cyto <- d$cytokines
+```
+
+## 1. Do the sample IDs match?
+
+All four tables must describe the same 93 samples. The helper `read_counts()` already reorders the count columns to match `metadata$sample_id`, but we check it anyway — if the IDs ever disagree, every later test would be silently wrong.
+
+```{r}
+# The distinct sample IDs in each table, as sets
+ids <- list(
+  metadata = meta$sample_id,
+  cytokines = cyto$sample_id,
+  species_cols = colnames(species),
+  genes_cols = colnames(genes)
+)
+
+# setequal() ignores order; identical() asks if the order already matches
+data.frame(
+  table = names(ids),
+  n_ids = sapply(ids, length),
+  same_set_as_metadata = sapply(ids, setequal, y = meta$sample_id),
+  same_order_as_metadata = sapply(ids, identical, y = meta$sample_id)
+)
+```
+
+All four tables hold the same 93 sample IDs, and the count matrices are already in metadata order, so every row of `meta` lines up with its column of counts. If any of this were `FALSE`, we would stop and fix it before testing anything.
+
+## 2. Library sizes
+
+The **library size** is the total count in a sample: total reads assigned to species, or total reads mapped to genes. Very small libraries are unreliable, and wildly uneven sizes can drive apparent differences, so we plot both.
+
+```{r}
+lib <- data.frame(
+  sample_id = meta$sample_id,
+  species_total = colSums(species),
+  genes_total = colSums(genes)
+)
+
+summary(lib[, c("species_total", "genes_total")])
+```
+
+```{r}
+# Histograms side by side; the red dashed line is the median
+lib |>
+  pivot_longer(cols = c(species_total, genes_total),
+               names_to = "table", values_to = "total") |>
+  ggplot(aes(total)) +
+  geom_histogram(bins = 30, fill = "grey70", colour = "white") +
+  geom_vline(aes(xintercept = median(total)), linetype = "dashed", colour = "red") +
+  facet_wrap(~ table, scales = "free") +
+  labs(title = "Library sizes per sample",
+       x = "total counts per sample", y = "number of samples") +
+  theme_minimal()
+```
+
+```{r}
+# Smallest libraries — worth knowing who they are before filtering
+lib |> slice_min(species_total, n = 3)
+lib |> slice_min(genes_total, n = 3)
+```
+
+## 3. Missing values
+
+Missing data in the metadata and the cytokines table. Counts tables are not checked here because a zero is a real observation, not a missing value.
+
+```{r}
+# Missing values per column, only showing columns that have any
+missing_meta <- tibble(column = names(meta), n_missing = colSums(is.na(meta)))
+missing_meta |> filter(n_missing > 0)
+
+missing_cyto <- tibble(column = names(cyto), n_missing = colSums(is.na(cyto)))
+missing_cyto |> filter(n_missing > 0)
+```
+
+```{r}
+# How many samples have at least one missing cytokine?
+cat(sum(rowSums(is.na(cyto)) > 0), "of", nrow(cyto),
+    "samples have at least one missing cytokine value\n")
+```
+
+The cytokine values that are missing are dropped sample-by-sample in whatever cytokine analysis follows; the metadata is complete, so no samples need to be excluded from the microbiome or RNA work.
+
+## 4. RNA batch vs arm
+
+The RNA was sequenced in two batches (B1, B2). If one batch contained mostly one arm, batch effects could masquerade as arm effects, so we cross-tabulate.
+
+```{r}
+with(meta, table(arm, rnaseq_batch))
+```
+
+```{r}
+# Same numbers as proportions within each arm
+with(meta, prop.table(table(arm, rnaseq_batch), margin = 1)) |>
+  round(2)
+```
+
+Both batches contain samples from all three arms, so no arm is confined to a single batch. Any downstream RNA analysis can adjust for `rnaseq_batch` if the batch effect turns out to be large.
+
+## 5. Shannon alpha diversity
+
+The **Shannon index** summarises how diverse each sample's microbiome is: it grows with the number of species present and with how evenly their counts are spread. Higher = more diverse. We compute it per sample and compare arms.
+
+```{r}
+# vegan wants samples in rows, so we transpose the matrix
+alpha <- diversity(t(species), index = "shannon")
+
+alpha_df <- data.frame(
+  sample_id = names(alpha),
+  shannon = as.numeric(alpha)
+) |>
+  left_join(meta, by = "sample_id")
+
+summary(alpha_df$shannon)
+```
+
+```{r}
+# Shannon by arm — a boxplot shows the spread in each group
+ggplot(alpha_df, aes(arm, shannon, fill = arm)) +
+  geom_boxplot(outlier.alpha = 0.5, show.legend = FALSE) +
+  geom_jitter(width = 0.15, alpha = 0.5) +
+  labs(title = "Shannon alpha diversity by arm",
+       x = "contraceptive arm", y = "Shannon index") +
+  theme_minimal()
+```
+
+A per-arm summary, so the numbers behind the plot can be read off directly:
+
+```{r}
+alpha_df |>
+  group_by(arm) |>
+  summarise(n = n(), mean_shannon = mean(shannon), sd_shannon = sd(shannon))
+```
+
+## Choices made
+
+- **Sample ID check** used `setequal()` plus an order check, rather than trusting `read_counts()`'s internal `stopifnot()`.
+- **Library sizes** were shown as raw totals per sample; an alternative is relative abundance or rarefaction, which we did not use.
+- **Missing values** were counted per column; we did not impute or drop samples at this stage.
+- **Batch balance** was summarised with a cross-tab and within-arm proportions; no statistical test of balance was run.
+- **Shannon index** was computed on untransformed species counts with `vegan::diversity()`; alternatives include Simpson index or phylogenetic diversity, and microViz's `tax_alpha()` gives the same Shannon values.
+- **No species were pre-filtered** before computing Shannon; low-abundance filtering is a choice to revisit in the main analysis.
